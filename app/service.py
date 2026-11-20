@@ -7,6 +7,11 @@
    才在同一事务内整体替换数据库边表并 upsert 扫描表 —— 任一步失败则
    回滚，旧扫描与层级保持不变，不会只更新上层箱而漏掉内盒。
 3. 重放中发现的首个非法序号通过 ``ReplayConflict.conflict_seq`` 返回。
+4. 启动时对库中全部生效扫描按序号做一次全量重放校验；校验失败则服务进入
+   停供状态（``/health`` 与 ``/boxes/{box}`` 返回 503 并指出首个冲突序号），
+   数据员仍可通过 ``POST /scans/batch`` 补传/更正。校验状态以数据库中已
+   提交的扫描为准，多进程共享同一卷时以最后一次成功提交的结果为准，旧进程
+   缓存的停供结论不会在别人修复后再次停供。
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ class BatchError(Exception):
 
 
 class ReplayConflict(Exception):
-    """重放层级规则时的冲突（HTTP 409），带首个冲突序号。"""
+    """重放层级规则时的冲突（HTTP 409/503），带首个冲突序号。"""
 
     def __init__(self, conflict_seq: int, reason: str) -> None:
         super().__init__(reason)
@@ -132,9 +137,13 @@ def _check_cycle(seq: int, edges: Dict[str, str], child: str, parent: str) -> No
 
 
 def replay(
-    stored: List[sqlite3.Row], incoming: List[ScanIn]
+    stored: List[sqlite3.Row], incoming: Optional[List[ScanIn]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """合并已存扫描与本批扫描，按序号重放，返回 (有序扫描, 新归属边表)。"""
+    """合并已存扫描与本批扫描，按序号重放，返回 (有序扫描, 新归属边表)。
+
+    ``incoming`` 为空时等价于只对库中已提交的生效扫描做全量重放，
+    供启动校验使用。
+    """
 
     merged: Dict[str, Dict[str, Any]] = {
         row["scan_no"]: {
@@ -148,7 +157,7 @@ def replay(
     }
 
     # 修订检查与合并
-    for item in incoming:
+    for item in incoming or []:
         old = merged.get(item.scan_no)
         if old is not None:
             if item.revision < old["revision"]:
@@ -212,7 +221,12 @@ def _load_state(conn: sqlite3.Connection) -> Tuple[List[sqlite3.Row], Dict[str, 
 
 
 def submit_batch(batch: BatchIn) -> Dict[str, Any]:
-    """提交一批扫描；成功返回盒码路径变化，失败保证旧状态不变。"""
+    """提交一批扫描；成功返回盒码路径变化，失败保证旧状态不变。
+
+    停供期间本接口仍然开放：整批补传/更正通过全量重放且无冲突时，扫描、
+    修复后的归属边表与恢复供数在同一事务内一起生效；任一校验失败则回滚，
+    保留原扫描和归属并继续停供。
+    """
 
     validate_batch(batch)
 
@@ -261,6 +275,12 @@ def submit_batch(batch: BatchIn) -> Dict[str, Any]:
             """,
             [item.model_dump() for item in batch.scans],
         )
+        # 与扫描/边表同一事务推进版本号：提交成功即代表库中生效扫描已可
+        # 无冲突重放，其他进程凭版本号感知修复，不会沿用旧的停供结论。
+        conn.execute(
+            "INSERT INTO service_meta(key, value) VALUES('state_version', 1) "
+            "ON CONFLICT(key) DO UPDATE SET value = value + 1"
+        )
         return {"accepted": True, "replayed_scans": len(ordered), "changes": changes}
 
 
@@ -292,3 +312,116 @@ def get_box_path(box: str) -> Optional[Dict[str, Any]]:
         "pallet": pallet_of(edges, box),
         "path": path,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 服务状态：启动校验、停供与多进程状态协调
+# --------------------------------------------------------------------------- #
+class ServiceStatus:
+    """进程内缓存的服务状态，以库中 ``state_version`` 为失效依据。
+
+    停供结论只在缓存版本仍等于数据库当前版本时有效：同一卷上的另一进程
+    一旦提交有效更正（事务内推进版本号），本进程下一次查询即重新按库中
+    有效扫描校验并恢复供数，旧的启动校验结果不会再次停供。
+    """
+
+    def __init__(self) -> None:
+        self._lock = write_lock
+        self._version: Optional[int] = None
+        self._conflict_seq: Optional[int] = None
+        self._reason: Optional[str] = None
+
+    def _read_version(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT value FROM service_meta WHERE key = 'state_version'"
+        ).fetchone()
+        return int(row["value"]) if row is not None else 0
+
+    def verify_on_startup(self) -> None:
+        """启动时按全线序号校验旧 SQLite 卷中的全部生效扫描。"""
+
+        with self._lock:
+            conn = connect()
+            try:
+                stored = conn.execute("SELECT * FROM scans").fetchall()
+                version = self._read_version(conn)
+                try:
+                    _, edges = replay(stored)
+                except ReplayConflict as exc:
+                    self._version = version
+                    self._conflict_seq = exc.conflict_seq
+                    self._reason = exc.reason
+                    return
+                # 旧卷可能从未写过版本号：校验通过后补记，且顺手把偏离
+                # 重放结果的边表修正为权威归属（同一事务）。
+                self._repair_if_drifted(conn, edges)
+                if version == 0:
+                    conn.execute(
+                        "INSERT INTO service_meta(key, value) "
+                        "VALUES('state_version', 1) "
+                        "ON CONFLICT(key) DO UPDATE SET value = value + 1"
+                    )
+                    conn.commit()
+                    version = self._read_version(conn)
+                self._version = version
+                self._conflict_seq = None
+                self._reason = None
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _repair_if_drifted(conn: sqlite3.Connection, edges: Dict[str, str]) -> None:
+        """边表与重放结果不一致时，以重放结果整体替换（仅启动校验路径）。"""
+
+        current = {
+            r["child"]: r["parent"]
+            for r in conn.execute("SELECT child, parent FROM edges")
+        }
+        if current != edges:
+            conn.execute("DELETE FROM edges")
+            conn.executemany(
+                "INSERT INTO edges(child, parent) VALUES (?, ?)",
+                list(edges.items()),
+            )
+            conn.commit()
+
+    def current(self) -> "ServiceStatus":
+        """返回与数据库已提交状态对齐后的当前状态（刷新过期缓存）。"""
+
+        with self._lock:
+            conn = connect()
+            try:
+                version = self._read_version(conn)
+                if self._version is not None and version == self._version:
+                    return self
+                # 版本变化（另一进程提交了更正）或首次查询：按库中有效扫描重新确认
+                stored = conn.execute("SELECT * FROM scans").fetchall()
+                try:
+                    _, edges = replay(stored)
+                except ReplayConflict as exc:
+                    self._version = version
+                    self._conflict_seq = exc.conflict_seq
+                    self._reason = exc.reason
+                    return self
+                self._repair_if_drifted(conn, edges)
+                self._version = version
+                self._conflict_seq = None
+                self._reason = None
+                return self
+            finally:
+                conn.close()
+
+    @property
+    def available(self) -> bool:
+        return self._conflict_seq is None
+
+    @property
+    def conflict_seq(self) -> Optional[int]:
+        return self._conflict_seq
+
+    @property
+    def reason(self) -> Optional[str]:
+        return self._reason
+
+
+status = ServiceStatus()

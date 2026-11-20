@@ -9,6 +9,7 @@ os.environ["TRACE_DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="trace-test-"
 
 from app.db import connect, init_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.service import status  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
@@ -20,15 +21,19 @@ def _database():
 
 @pytest.fixture(autouse=True)
 def _clean_tables():
-    """每个测试前清空数据，保证用例互不干扰（结构保留）。"""
+    """每个测试前清空数据并重置停供状态，保证用例互不干扰（结构保留）。"""
 
     conn = connect()
     try:
         conn.execute("DELETE FROM edges")
         conn.execute("DELETE FROM scans")
+        conn.execute("DELETE FROM service_meta")
         conn.commit()
     finally:
         conn.close()
+    status._version = None
+    status._conflict_seq = None
+    status._reason = None
     yield
 
 

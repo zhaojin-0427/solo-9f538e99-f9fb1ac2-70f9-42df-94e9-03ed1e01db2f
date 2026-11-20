@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS edges (
     child  TEXT PRIMARY KEY,              -- 任一时点一个子项只能有一个父项
     parent TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS service_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 

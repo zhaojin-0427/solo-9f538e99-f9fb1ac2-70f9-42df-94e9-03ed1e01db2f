@@ -35,6 +35,34 @@
 * WAL 模式 + 进程内写锁串行化并发提交，读写并发下不会出现混合修订。
 * 数据落盘到 Docker 卷，重启后从已提交状态恢复。
 
+## 启动校验与停供恢复
+
+服务启动时按全线 `seq` 序号对旧 SQLite 卷中的**全部生效扫描**做一次全量重放
+校验（角色规则、环、序号唯一性），不再无条件报告健康：
+
+* 重放无冲突：服务正常供数；若卷中边表与重放结果不一致（旧版本遗留的旧路径），
+  启动时以重放结果在同一事务内整体修正边表。
+* 重放发现冲突：服务进入**停供**状态，`GET /health` 与 `GET /boxes/{box}`
+  一律返回 **503**，响应体指出**首个冲突序号** `conflict_seq`；`/docs` 与
+  `POST /scans/batch` 仍可使用，数据员可补传或更正。
+* 停供期间的整批补传/更正必须使**全部生效扫描**按原规则重放无冲突：校验通过后，
+  扫描、修复后的归属边表与恢复供数在**同一事务**内一起生效；任一步失败则回滚，
+  保留原扫描和归属，继续停供。
+* 同卷多进程以同一已提交状态为准：每次成功提交在事务内推进 `state_version`，
+  进程仅在版本号变化时重新按库中有效扫描确认状态，查询不逐笔重放扫描。另一进程
+  已提交有效更正后，较早的启动停供结论自动失效，不会再次停供。
+* 重启后始终按库中当前有效扫描重新确认服务状态。
+
+### 停供响应示例（HTTP 503）
+
+```json
+{
+  "error": "service_unavailable",
+  "message": "库中生效扫描重放存在冲突，服务已停供；首个冲突序号 2：……。请通过 POST /scans/batch 补传或更正，全量重放无冲突后自动恢复。",
+  "conflict_seq": 2
+}
+```
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -52,7 +80,7 @@ docker compose up --build
 pip install -r requirements.txt
 pip install pytest httpx
 TRACE_DB_PATH=./data/trace.db uvicorn app.main:app --reload
-pytest          # 17 个端到端测试
+pytest          # 29 个端到端测试
 ```
 
 ## 接口
@@ -100,6 +128,9 @@ pytest          # 17 个端到端测试
 | 409 | 修订冲突、序号历史冲突、角色违规、环（带 `conflict_seq`） |
 | 422 | 字段类型/编码前缀/批次超 100 笔等 schema 校验失败 |
 
+`GET /health` 与 `GET /boxes/{box}` 额外可能返回 **503**：启动校验或状态刷新
+发现库中生效扫描重放冲突时停供（带 `conflict_seq`），更正提交成功后自动恢复。
+
 ### `GET /boxes/{box}` 按盒查询当前完整包装路径
 
 ```bash
@@ -119,15 +150,19 @@ curl http://localhost:8000/boxes/B:box01
 
 ### `GET /health` 健康检查
 
+正常返回 `200 {"status":"ok"}`；启动校验发现生效扫描重放冲突时返回
+`503`（带首个冲突序号），Docker 健康检查据此标记容器 `unhealthy`，
+但容器不退出，数据员仍可访问 `/docs` 提交补传/更正。
+
 ## 项目结构
 
 ```
 app/
-  main.py      FastAPI 路由与异常映射
-  service.py   修订合并、按序号重放、环/角色/双归属校验、路径计算
+  main.py      FastAPI 路由、异常映射、停供 503 响应
+  service.py   修订合并、按序号重放、环/角色/双归属校验、路径计算、启动校验与服务状态
   db.py        SQLite 连接、WAL、写锁、建表
   schemas.py   Pydantic 请求/响应模型
-tests/         端到端测试（含并发、重启恢复、整批回滚）
+tests/         端到端测试（含并发、重启恢复、停供/修复、多进程状态协调、整批回滚）
 Dockerfile
 docker-compose.yml
 ```
