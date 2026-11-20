@@ -1,0 +1,15 @@
+services:
+  trace-api:
+    build: .
+    image: drug-trace-api:latest
+    container_name: drug-trace-api
+    ports:
+      - "8000:8000"
+    environment:
+      TRACE_DB_PATH: /data/trace.db
+    volumes:
+      - trace-data:/data
+    restart: unless-stopped
+
+volumes:
+  trace-data:
