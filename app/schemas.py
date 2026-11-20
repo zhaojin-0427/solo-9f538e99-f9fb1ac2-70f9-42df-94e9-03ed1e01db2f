@@ -57,3 +57,18 @@ class BoxPathOut(BaseModel):
     parent: Optional[str]
     pallet: Optional[str]
     path: List[str] = Field(..., description="完整当前包装路径，自顶（托盘）向底（盒）")
+
+
+class HealthOut(BaseModel):
+    status: str = Field(..., description="ok 表示库中生效扫描重放无冲突，服务供数")
+
+
+class SuspendedOut(BaseModel):
+    """停供响应（HTTP 503）：库中生效扫描重放冲突。"""
+
+    error: str = "service_suspended"
+    message: str
+    conflict_seq: Optional[int] = Field(
+        None, description="首个冲突的全线序号，补传/更正时优先修正它"
+    )
+    status: str = "conflict"
